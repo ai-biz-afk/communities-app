@@ -50,6 +50,7 @@
   }
   .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #4CAF50; flex-shrink: 0; }
   .status-dot.loading { background: #FF9800; animation: pulse 1s infinite; }
+  .status-dot.error { background: #F44336; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
   .template-wrap {
     height: var(--template-h); background: white;
@@ -96,6 +97,7 @@
     color: white; border-radius: 18px 4px 18px 18px;
   }
   .bubble.error { background: #FFF0F0; color: #C0392B; border: 1px solid #FFCCCC; font-size: 16px; }
+  .bubble.warning { background: #FFF8E1; color: #E65100; border: 1px solid #FFE082; font-size: 16px; }
   .typing-indicator { display: flex; gap: 4px; align-items: center; padding: 12px 16px; }
   .typing-dot {
     width: 8px; height: 8px; border-radius: 50%; background: #A8C8C8;
@@ -163,16 +165,25 @@
   <button class="send-btn" id="send-btn" onclick="sendMessage()" disabled>➤</button>
 </div>
 <script>
+// ============================================================
+// ★ 設定（GASのウェブアプリURLに変更してください）
+// ============================================================
 const GAS_URL = 'https://script.google.com/macros/s/AKfycbym7nhBcVjdH5AtOCea7GlIz9_4uc-k5J24IO1icPlWrlDbObfp-jpzpSCrjt6zE1vGOA/exec';
 
+// ストレージキー
 const STORAGE_KEY_DOC  = 'community_doc_content';
 const STORAGE_KEY_CHAT = 'community_chat_history';
 const STORAGE_KEY_DATE = 'community_last_updated';
 
+// ★ ドキュメントはここに1度だけ読み込んでメモリで保持
+//    毎回GASに送らず、GAS側のキャッシュに任せる
 let docContent = '';
 let chatHistory = [];
 let isLoading = false;
 
+// ============================================================
+// 初期化
+// ============================================================
 window.addEventListener('load', () => {
   setTodayLabel();
   loadFromStorage();
@@ -189,19 +200,22 @@ function setTodayLabel() {
     `${now.getFullYear()}年${now.getMonth()+1}月${now.getDate()}日`;
 }
 
+// ============================================================
+// ドキュメント管理
+// ============================================================
 function loadFromStorage() {
-  const saved = localStorage.getItem(STORAGE_KEY_DOC);
+  const saved    = localStorage.getItem(STORAGE_KEY_DOC);
   const savedDate = localStorage.getItem(STORAGE_KEY_DATE);
   if (saved) {
     docContent = saved;
-    setStatus(true, `データ読み込み済み${savedDate ? '（' + savedDate + ' 時点）' : ''}`);
+    setStatus('ok', `データ読み込み済み${savedDate ? '（' + savedDate + ' 時点）' : ''}`);
   } else {
     fetchDocFromGAS();
   }
 }
 
 async function fetchDocFromGAS() {
-  setStatus(false, 'データを取得中...');
+  setStatus('loading', 'データを取得中...');
   document.getElementById('btn-update').disabled = true;
   try {
     const res = await fetch(GAS_URL + '?action=getDoc');
@@ -213,9 +227,9 @@ async function fetchDocFromGAS() {
     const dateStr = `${now.getMonth()+1}/${now.getDate()} ${now.getHours()}:${String(now.getMinutes()).padStart(2,'0')}`;
     localStorage.setItem(STORAGE_KEY_DOC, docContent);
     localStorage.setItem(STORAGE_KEY_DATE, dateStr);
-    setStatus(true, `最新データを取得しました（${dateStr}）`);
+    setStatus('ok', `最新データを取得しました（${dateStr}）`);
   } catch (e) {
-    setStatus(false, 'データ取得に失敗しました。しばらくしてから🔄更新を押してください。');
+    setStatus('error', 'データ取得に失敗しました。しばらくしてから🔄更新を押してください。');
   } finally {
     document.getElementById('btn-update').disabled = false;
   }
@@ -227,11 +241,16 @@ function updateData() {
   fetchDocFromGAS();
 }
 
-function setStatus(ok, text) {
-  document.getElementById('status-dot').className = 'status-dot' + (ok ? '' : ' loading');
+// ok / loading / error の3種類
+function setStatus(state, text) {
+  const dot = document.getElementById('status-dot');
+  dot.className = 'status-dot' + (state === 'loading' ? ' loading' : state === 'error' ? ' error' : '');
   document.getElementById('status-text').textContent = text;
 }
 
+// ============================================================
+// チャット表示
+// ============================================================
 function showGreeting() {
   const saved = localStorage.getItem(STORAGE_KEY_CHAT);
   if (saved) {
@@ -263,6 +282,9 @@ function handleKey(e) {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 }
 
+// ============================================================
+// メッセージ送信（メイン処理）
+// ============================================================
 async function sendMessage() {
   const inputBox = document.getElementById('input-box');
   const text = inputBox.value.trim();
@@ -273,22 +295,28 @@ async function sendMessage() {
 
   appendBubble('user', text);
   chatHistory.push({ role: 'user', content: text });
-
-  // ユーザーメッセージを画面上部に表示
   scrollToMessage('last-user');
 
   const typingId = showTyping();
   isLoading = true;
 
   try {
-    const reply = await callGAS();
+    // ★ リトライ付きでGASを呼び出す
+    const reply = await callGASWithRetry();
     hideTyping(typingId);
-    appendBubble('bot', reply);
-    chatHistory.push({ role: 'assistant', content: reply });
-    if (chatHistory.length > 40) chatHistory = chatHistory.slice(-40);
-    localStorage.setItem(STORAGE_KEY_CHAT, JSON.stringify(chatHistory));
 
-    // ボット返答後もユーザーメッセージが上部に見える位置を維持
+    // rate_limitの場合は警告バブルで表示
+    if (reply.isRateLimit) {
+      appendBubble('warning', reply.message);
+      // rate_limit時はchatHistoryに追加しない（再送できるように）
+      chatHistory.pop(); // 送ったユーザーメッセージも戻す
+    } else {
+      appendBubble('bot', reply.message);
+      chatHistory.push({ role: 'assistant', content: reply.message });
+      if (chatHistory.length > 40) chatHistory = chatHistory.slice(-40);
+      localStorage.setItem(STORAGE_KEY_CHAT, JSON.stringify(chatHistory));
+    }
+
     scrollToMessage('last-user');
 
   } catch (e) {
@@ -297,45 +325,81 @@ async function sendMessage() {
     scrollToBottom();
   } finally {
     isLoading = false;
+    // 送信ボタンを再度有効化
+    document.getElementById('send-btn').disabled =
+      document.getElementById('input-box').value.trim().length === 0;
   }
 }
 
-function scrollToMessage(target) {
-  const chatArea = document.getElementById('chat-area');
-  if (target === 'last-user') {
-    // ユーザーメッセージ（.msg-row.user）の最後のものを取得
-    const userMessages = chatArea.querySelectorAll('.msg-row.user');
-    if (userMessages.length > 0) {
-      const lastUserMsg = userMessages[userMessages.length - 1];
-      // ユーザーメッセージの上端がチャットエリアの上部に来るようにスクロール
-      const msgTop = lastUserMsg.offsetTop - chatArea.offsetTop;
-      chatArea.scrollTo({ top: msgTop - 16, behavior: 'smooth' });
+// ============================================================
+// ★ GAS呼び出し（フロント側リトライ付き）
+//    429 / rate_limit が返った場合、最大2回まで再試行
+// ============================================================
+async function callGASWithRetry(maxRetries = 2) {
+  let lastResult;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    if (attempt > 0) {
+      // リトライ前に待機（5秒 → 10秒）
+      const waitSec = attempt * 5;
+      setStatus('loading', `混み合っています。${waitSec}秒後に再試行中... (${attempt}/${maxRetries})`);
+      await sleep(waitSec * 1000);
     }
+
+    const result = await callGAS();
+
+    // 成功 or rate_limit以外のエラー → そのまま返す
+    if (!result.isRateLimit) return result;
+
+    lastResult = result;
+    // rate_limitならリトライ
   }
+
+  // 全リトライ失敗
+  setStatus('ok', '');
+  return lastResult;
 }
 
+// ============================================================
+// ★ GAS単体呼び出し
+//    ・docContentはGAS側キャッシュに任せるため送信しない
+//    ・rate_limitフラグを返す
+// ============================================================
 async function callGAS() {
   const response = await fetch(GAS_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'text/plain' },
     body: JSON.stringify({
       action: 'chat',
-      messages: chatHistory.slice(-20),
-      docContent: docContent
+      messages: chatHistory.slice(-20)
+      // ★ docContentをここで送らない → GAS側のキャッシュが使われる
     })
   });
+
   if (!response.ok) throw new Error(`GASエラー (${response.status})`);
+
   const data = await response.json();
+
+  // GASからrate_limitエラーが返ってきた場合
+  if (data.error === 'rate_limit') {
+    return { isRateLimit: true, message: data.reply };
+  }
+
+  // その他エラー
   if (data.error) throw new Error(data.error);
-  return data.reply;
+
+  return { isRateLimit: false, message: data.reply };
 }
 
+// ============================================================
+// UI ヘルパー
+// ============================================================
 function appendBubble(type, text) {
   const chatArea = document.getElementById('chat-area');
   const row = document.createElement('div');
   row.className = 'msg-row' + (type === 'user' ? ' user' : '');
   const bubble = document.createElement('div');
-  bubble.className = 'bubble ' + (type === 'error' ? 'error' : type === 'user' ? 'user' : 'bot');
+  bubble.className = 'bubble ' + (['error','warning'].includes(type) ? type : type === 'user' ? 'user' : 'bot');
   bubble.innerHTML = cleanMarkdown(text).replace(/\n/g, '<br>');
   if (type !== 'user') {
     const avatar = document.createElement('div');
@@ -379,11 +443,26 @@ function showTyping() {
 
 function hideTyping(id) { const el = document.getElementById(id); if (el) el.remove(); }
 function scrollToBottom() { const c = document.getElementById('chat-area'); c.scrollTop = c.scrollHeight; }
+
+function scrollToMessage(target) {
+  const chatArea = document.getElementById('chat-area');
+  if (target === 'last-user') {
+    const userMessages = chatArea.querySelectorAll('.msg-row.user');
+    if (userMessages.length > 0) {
+      const lastUserMsg = userMessages[userMessages.length - 1];
+      const msgTop = lastUserMsg.offsetTop - chatArea.offsetTop;
+      chatArea.scrollTo({ top: msgTop - 16, behavior: 'smooth' });
+    }
+  }
+}
+
 function autoResize(el) {
   el.style.height = 'auto';
   el.style.height = Math.min(el.scrollHeight, 120) + 'px';
   document.getElementById('send-btn').disabled = el.value.trim().length === 0 || isLoading;
 }
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 </script>
 </body>
 </html>
